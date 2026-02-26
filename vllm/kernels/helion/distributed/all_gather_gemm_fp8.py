@@ -319,6 +319,8 @@ def helion_all_gather_fp8_gemm_fake(
 
     return a_out_empty_tensor, c_empty_tensor
 
+import torch.cuda.nvtx as nvtx
+
 def helion_all_gather_fp8_gemm(
     a_shared: torch.Tensor,
     b: torch.Tensor,
@@ -330,6 +332,7 @@ def helion_all_gather_fp8_gemm(
     progress: torch.Tensor | None = None,
     SPLITS_PER_RANK: int = 1,      
 ) -> tuple[torch.Tensor, torch.Tensor]:
+   with nvtx.range("helion_all_gather_fp8_gemm"):
     from vllm.distributed.parallel_state import _groups
     
     assert group_name in _groups, f"Group {group_name} is not found."
@@ -341,6 +344,8 @@ def helion_all_gather_fp8_gemm(
     return group._helion_all_gather_fp8_gemm(
         a_shared, b, scale_a, scale_b, a_out, progress, SPLITS_PER_RANK
     )
+
+
 
 from vllm.utils.torch_utils import (
     direct_register_custom_op,
