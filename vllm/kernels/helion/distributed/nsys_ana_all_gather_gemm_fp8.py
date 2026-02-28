@@ -5,6 +5,7 @@ import os
 import weakref
 from dataclasses import dataclass
 from typing import Callable, Optional, Union, List, Tuple
+import torch.cuda.nvtx as nvtx
 
 import torch
 import torch.distributed as dist
@@ -61,7 +62,6 @@ def setup_distributed():
 
 def benchmark_all_gather_gemm_fp8(TEST_SHAPES: List[Tuple[int, int, int]], rank: int, local_rank: int, world_size: int, device: torch.device, dist_group: dist.ProcessGroup, world_group: GroupCoordinator, repeat: int = 50):
     MB = 1024 ** 2
-    rows: List[Row] = []
 
     group_name = getattr(dist_group, "group_name", "world")
 
@@ -104,29 +104,42 @@ def benchmark_all_gather_gemm_fp8(TEST_SHAPES: List[Tuple[int, int, int]], rank:
                 group_name,
                 SPLITS_PER_RANK=sp,
             )
-            # baseline_kernel = lambda: torch.ops.symm_mem.fused_all_gather_scaled_matmul(
-            #     a_shared_symm,
-            #     [b],
-            #     scale_a,
-            #     [scale_b],
-            #     gather_dim=0,
-            #     biases=[None],
-            #     result_scales=[None],
-            #     out_dtypes=[torch.bfloat16],
-            #     use_fast_accum=[False],
-            #     group_name=group_name,
-            # )
-            NSIGHT_MODE = os.getenv("NSIGHT_PROFILE") == "1"
-            if NSIGHT_MODE:
-                # minimal single run
-                for _ in range(5):
-                    helion_kernel()
-                torch.cuda.synchronize()
-
-                dist.barrier()
+            baseline_kernel = lambda: torch.ops.symm_mem.fused_all_gather_scaled_matmul(
+                a_shared_symm,
+                [b],
+                scale_a,
+                [scale_b],
+                gather_dim=0,
+                biases=[None],
+                result_scales=[None],
+                out_dtypes=[torch.bfloat16],
+                use_fast_accum=[False],
+                group_name=group_name,
+            )
+            for _ in range(50):
                 helion_kernel()
-                torch.cuda.synchronize()
-                dist.barrier()
+            torch.cuda.synchronize()
+            dist.barrier()
+
+            dist.barrier()
+            with nvtx.range("Helion"):
+                for _ in range(50):
+                    helion_kernel()
+                torch.cuda.synchronize() 
+            dist.barrier()
+
+                        # minimal single run
+            for _ in range(50):
+                baseline_kernel()
+            torch.cuda.synchronize()
+            dist.barrier()
+
+            dist.barrier()
+            with nvtx.range("Baseline"):
+                for _ in range(50):
+                    baseline_kernel()
+                torch.cuda.synchronize() 
+            dist.barrier()
 
 
     dist.barrier()  # ensure all ranks finished
@@ -143,8 +156,8 @@ if __name__ == "__main__":
         #(128, 128, 128),
         #(256, 1024, 1024),
         #medium shapes
-        (2048, 1024, 2048), 
-        #(2048, 4096, 4096),
+        #(2048, 1024, 2048), 
+        (2048, 4096, 4096),
         #(4096, 2048, 4096),
         #large shapes
         #(4096, 5120, 5120), # this fails to do_bench_distributed_graph

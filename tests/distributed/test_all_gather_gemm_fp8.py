@@ -140,10 +140,10 @@ def run_shape_test(M, K, N, rank, world_size, device, dist_group, world_group):
     #(256, 1024, 1024),
     #medium shapes
     #(2048, 1024, 2048),
-    #(2048, 4096, 4096),
+    (2048, 4096, 4096),
     #(4096, 2048, 4096),
     #large shapes
-    (4096, 5120, 5120),
+    #(4096, 5120, 5120),
     #(8192, 8192, 8192),
 ])
 def test_helion_fp8_all_gather_matmul(M, K, N):

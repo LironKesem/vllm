@@ -47,8 +47,8 @@ def helion_matmul_w_progress_fp8(
             signal=1,
         )
         # Load scales once per tile
-        sa = scale_a[tile_m, :].to(torch.float32)  # [tile_m, 1]
-        sb = scale_b[:, tile_n].to(torch.float32)  # [1, tile_n]
+        sa = scale_a[tile_m, :] # [tile_m, 1]
+        sb = scale_b[:, tile_n] # [1, tile_n]
 
         for tile_k in hl.tile(K):
             # Cast FP8 -> FP32 for accumulation
@@ -203,7 +203,7 @@ def copy_engine_all_gather_w_progress(
     assert list(output.shape) == output_shape, "Mismatch in output shape"
     chunks = output.chunk(world_size * splits_per_rank)
 
-    symm_mem_hdl.barrier()
+    #symm_mem_hdl.barrier()
     backend_stream.wait_stream(torch.cuda.current_stream())
 
     with torch.cuda.stream(backend_stream):
@@ -213,14 +213,14 @@ def copy_engine_all_gather_w_progress(
                 src_buf = symm_mem_hdl.get_buffer(
                     src_rank, chunks[0].shape, inp.dtype, chunks[0].numel() * split_id
                 )
-                chunks[src_rank * splits_per_rank + split_id].copy_(src_buf)
+                chunks[src_rank * splits_per_rank + split_id].copy_(src_buf, non_blocking=True)
                 # Write progress signal
                 symm_mem_hdl.stream_write_value32(
                     progress,
                     offset=src_rank * splits_per_rank + split_id,
                     val=1,
                 )
-        symm_mem_hdl.barrier()
+        #symm_mem_hdl.barrier()
 
     return backend_stream
 
@@ -243,26 +243,25 @@ def _helion_all_gather_fp8_gemm_runtime(
     }
 
 
-    symm_mem_group = group_name
     symm_mem_hdl = dist._symmetric_memory.rendezvous(a_shared, group=group_name)
 
-    if symm_mem_hdl is None:
-        a_shared_symm = dist._symmetric_memory.empty(
-            a_shared.shape,
-            dtype=a_shared.dtype,
-            device=a_shared.device
-        )
-        a_shared_symm.copy_(a_shared)
-        a_shared_symm._is_symmetric_memory = True
+    # if symm_mem_hdl is None:
+    #     a_shared_symm = dist._symmetric_memory.empty(
+    #         a_shared.shape,
+    #         dtype=a_shared.dtype,
+    #         device=a_shared.device
+    #     )
+    #     a_shared_symm.copy_(a_shared)
+    #     a_shared_symm._is_symmetric_memory = True
 
-        # Try rendezvous again with the symmetric copy
-        symm_mem_hdl = dist._symmetric_memory.rendezvous(a_shared_symm, group=group_name)
-        if symm_mem_hdl is None:
-            raise RuntimeError("Failed to get symmetric memory handle after copy")
-    else:
-        a_shared_symm = a_shared  # already usable
+    #     # Try rendezvous again with the symmetric copy
+    #     symm_mem_hdl = dist._symmetric_memory.rendezvous(a_shared_symm, group=group_name)
+    #     if symm_mem_hdl is None:
+    #         raise RuntimeError("Failed to get symmetric memory handle after copy")
+    #else:
+        #a_shared_symm = a_shared  # already usable
 
-    a_shape = list(a_shared_symm.shape)
+    a_shape = list(a_shared.shape)
     a_shape[0] *= symm_mem_hdl.world_size
     configs["RANK"] = symm_mem_hdl.rank
     configs["WORLD_SIZE"] = symm_mem_hdl.world_size
@@ -273,17 +272,17 @@ def _helion_all_gather_fp8_gemm_runtime(
         progress = torch.zeros(
             symm_mem_hdl.world_size * configs["SPLITS_PER_RANK"],
             dtype=torch.uint32,
-            device=a_shared_symm.device,
+            device=a_shared.device,
         )
     else:
         progress.fill_(0) # Reset progress to 0.
     backend_stream = copy_engine_all_gather_w_progress(
-        a_out, a_shared_symm, progress, group_name, configs["SPLITS_PER_RANK"]
+        a_out, a_shared, progress, group_name, configs["SPLITS_PER_RANK"]
     )
     
     c = helion_matmul_w_progress_fp8(
         a_out,
-        a_shared_symm,
+        a_shared,
         scale_a,
         b,
         scale_b,
@@ -319,7 +318,7 @@ def helion_all_gather_fp8_gemm_fake(
 
     return a_out_empty_tensor, c_empty_tensor
 
-import torch.cuda.nvtx as nvtx
+#import torch.cuda.nvtx as nvtx
 
 def helion_all_gather_fp8_gemm(
     a_shared: torch.Tensor,
@@ -332,7 +331,7 @@ def helion_all_gather_fp8_gemm(
     progress: torch.Tensor | None = None,
     SPLITS_PER_RANK: int = 1,      
 ) -> tuple[torch.Tensor, torch.Tensor]:
-   with nvtx.range("helion_all_gather_fp8_gemm"):
+   #with nvtx.range("helion_all_gather_fp8_gemm"):
     from vllm.distributed.parallel_state import _groups
     
     assert group_name in _groups, f"Group {group_name} is not found."

@@ -77,7 +77,7 @@ def do_bench_distributed(
     device: Optional[Union[torch.device, int]] = None,
     dist_group: Optional[dist.ProcessGroup] = None,
     return_mode: str = "mean",
-    warmup: int = 5,
+    warmup: int = 50,
     post_iteration_barrier: bool = False,
 ) -> Union[float, List[float]]:
     """
@@ -272,15 +272,10 @@ def benchmark_all_gather_gemm_fp8(TEST_SHAPES: List[Tuple[int, int, int]], rank:
         for sp in candidate_splits:
             if M_per_rank % sp != 0:
                 continue  # skip invalid splits
-
+            input_args = (a_shared_symm, b, scale_a, scale_b, world_size, group_name)
+            input_kwargs = {"SPLITS_PER_RANK": sp}
             helion_kernel = lambda: torch.ops.vllm.helion_all_gather_fp8_gemm(
-                a_shared_symm,
-                b,
-                scale_a,
-                scale_b,
-                world_size,
-                group_name,
-                SPLITS_PER_RANK=sp,
+                *input_args, **input_kwargs
             )
             baseline_kernel = lambda: torch.ops.symm_mem.fused_all_gather_scaled_matmul(
                 a_shared_symm,
@@ -296,65 +291,24 @@ def benchmark_all_gather_gemm_fp8(TEST_SHAPES: List[Tuple[int, int, int]], rank:
             )
             # if rank == 0:
             #     print(f"[Rank:{rank}] Sanity check Testing shape M={M},N={N},K={K} with split {sp} (tokens per rank: {M_per_rank})")
+            
             a_out, c = helion_kernel()
             ag_golden, mm_golden = baseline_kernel()
             torch.testing.assert_close(a_out, ag_golden), "All-gather outputs do not match"
             torch.testing.assert_close(c, mm_golden[0].to(torch.bfloat16), rtol=1e-1, atol=1e-1), "Matmul outputs do not match"
-            if os.getenv("PROFILING") == "1":
-                # ---- Prepare the kernel for profiling ----
-                for _ in range(3):
-                    helion_kernel()
-                torch.cuda.synchronize()
-
-                # ---- PROFILE the helion kernel (only on rank 0) ----
-                if rank == 0:
-                    with profile(
-                        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                        record_shapes=True,
-                        with_stack=True,
-                        on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./logdir/helion_M{M}_N{N}_K{K}_sp{sp}_RANK{rank}')
-                    ) as prof:
-                        helion_kernel()
-                        torch.cuda.synchronize()
-                    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=12))
-                    print(f"Profiling trace saved. To view: tensorboard --logdir=./logdir")
-                # ---- Prepare the kernel for profiling (warmup) ----
-                for _ in range(3):
-                    baseline_kernel()
-                    torch.cuda.synchronize()
-                # ---- PROFILE the baseline kernel (only on rank 0) ----
-                if rank == 0:
-                    with profile(
-                        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                        record_shapes=True,
-                        with_stack=True,
-                        on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./logdir/baseline_M{M}_N{N}_K{K}_sp{sp}_RANK{rank}')
-                    ) as prof:
-                        baseline_kernel()
-                        torch.cuda.synchronize()
-                    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=12))
-                    print(f"Profiling trace saved. To view: tensorboard --logdir=./logdir")
-                    
             # benchmark Helion kernel
             torch.cuda.reset_peak_memory_stats(device)
-            # if rank == 0:
-            #     print(f" Rank:{rank}] Benchmarking Helion M={M},N={N},K={K} ")
             helion_latency = do_bench_distributed(helion_kernel, repeat=repeat, return_mode='mean', device=device, dist_group=dist_group)
             helion_peak_mem = torch.cuda.max_memory_allocated(device) / MB
 
             # benchmark baseline kernel
             torch.cuda.reset_peak_memory_stats(device)
-            # if rank == 0:
-            #     print(f"[Rank:{rank}] Benchmarking baseline M={M},N={N},K={K}")            
             baseline_latency = do_bench_distributed(baseline_kernel, repeat=repeat, return_mode='mean', device=device, dist_group=dist_group)
             baseline_peak_mem = torch.cuda.max_memory_allocated(device) / MB
 
             # compute speedup and memory improvement (guard against zero)
             speedup_x = baseline_latency / helion_latency if helion_latency > 0 else float("inf")
-            mem_improve_x = baseline_peak_mem / helion_peak_mem if helion_peak_mem > 0 else float("inf")
-
-            # if rank == 0:
-            #     print(f"Rank:{rank}] Finished Benchmarking on shape M={M},N={N},K={K}")            
+            mem_improve_x = baseline_peak_mem / helion_peak_mem if helion_peak_mem > 0 else float("inf")        
 
             rows.append(
                 Row(
@@ -386,8 +340,8 @@ if __name__ == "__main__":
         #(128, 128, 128),
         #(256, 1024, 1024),
         #medium shapes
-        (2048, 1024, 2048), 
-        #(2048, 4096, 4096),
+        #(2048, 1024, 2048), 
+        (2048, 4096, 4096),
         #(4096, 2048, 4096),
         #large shapes
         #(4096, 5120, 5120), # this fails to do_bench_distributed_graph
@@ -395,7 +349,7 @@ if __name__ == "__main__":
     ]
     rank, local_rank, world_size, device, dist_group, world_group = setup_distributed()
     try:
-        benchmark_all_gather_gemm_fp8(TEST_SHAPES, rank, local_rank, world_size, device, dist_group, world_group, repeat=10)
+        benchmark_all_gather_gemm_fp8(TEST_SHAPES, rank, local_rank, world_size, device, dist_group, world_group, repeat=50)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
