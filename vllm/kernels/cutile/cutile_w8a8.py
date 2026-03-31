@@ -87,21 +87,17 @@ def matmul_kernel(A, B, As, Bs, C,
     num_tiles_k = ct.cdiv(K, TILE_K)
 
     acc = ct.zeros((TILE_M, TILE_N), dtype=ct.float32)
-    zero_pad = ct.PaddingMode.ZERO
-
-    dtype = ct.tfloat32 if A.dtype == ct.float32 else A.dtype
 
     for k_idx in range(num_tiles_k):
-        a_tile = ct.load(A, index=(bid_m, k_idx), shape=(TILE_M, TILE_K), padding_mode=zero_pad)
-        b_tile = ct.load(B, index=(k_idx, bid_n), shape=(TILE_K, TILE_N), padding_mode=zero_pad)
+        a_tile = ct.load(A, index=(bid_m, k_idx), shape=(TILE_M, TILE_K))
+        b_tile = ct.load(B, index=(k_idx, bid_n), shape=(TILE_K, TILE_N))
 
         a_scale = ct.load(As, index=(bid_m, k_idx), shape=(TILE_M, 1))
         b_scale = ct.load(Bs, index=(k_idx, bid_n), shape=(1, 1))
 
-        a_fp32 = ct.astype(a_tile, ct.float32) * a_scale
-        b_fp32 = ct.astype(b_tile, ct.float32) * b_scale
-        
-        acc = ct.mma(a_fp32, b_fp32, acc)
+        dot_prod = ct.mma(a_tile, b_tile, ct.zeros((TILE_M, TILE_N), dtype=ct.float32))
+    
+        acc += dot_prod * (a_scale * b_scale)
 
     ct.store(C, index=(bid_m, bid_n), tile=ct.astype(acc, C.dtype))
 
