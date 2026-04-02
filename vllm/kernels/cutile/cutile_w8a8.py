@@ -78,11 +78,10 @@ def map_block_to_tile_grouped(M, N, tm, tn, GROUP_SIZE_M):
 
 
 @ct.kernel(num_ctas=ct.ByTarget(sm_121=4))
-def matmul_kernel(A, B, As, Bs, C, bias,
+def matmul_kernel(A, B, As, Bs, C,
                                  M: ConstInt, N: ConstInt, K: ConstInt,
                                  TILE_M: ConstInt, TILE_N: ConstInt, TILE_K: ConstInt,
-                                 GROUP_SIZE_M:ConstInt = 1,
-                                 USE_BIAS: ConstInt = 0 ):
+                                 GROUP_SIZE_M:ConstInt = 1,):
 
     bid_m, bid_n = map_block_to_tile_grouped(M, N, TILE_M, TILE_N, GROUP_SIZE_M)
     num_tiles_k = ct.cdiv(K, TILE_K)
@@ -99,9 +98,33 @@ def matmul_kernel(A, B, As, Bs, C, bias,
         dot_prod = ct.mma(a_tile, b_tile, ct.zeros((TILE_M, TILE_N), dtype=ct.float32))
     
         acc += dot_prod * (a_scale * b_scale)
-    if USE_BIAS:
-        bias_tile = ct.load(bias, index=(0, bid_n), shape=(1, TILE_N))
-        acc += bias_tile
+    ct.store(C, index=(bid_m, bid_n), tile=ct.astype(acc, C.dtype))
+
+
+@ct.kernel(num_ctas=ct.ByTarget(sm_121=4))
+def matmul_kernel_use_bias(A, B, As, Bs, C, bias,
+                                 M: ConstInt, N: ConstInt, K: ConstInt,
+                                 TILE_M: ConstInt, TILE_N: ConstInt, TILE_K: ConstInt,
+                                 GROUP_SIZE_M:ConstInt = 1):
+
+    bid_m, bid_n = map_block_to_tile_grouped(M, N, TILE_M, TILE_N, GROUP_SIZE_M)
+    num_tiles_k = ct.cdiv(K, TILE_K)
+
+    acc = ct.zeros((TILE_M, TILE_N), dtype=ct.float32)
+
+    for k_idx in range(num_tiles_k):
+        a_tile = ct.load(A, index=(bid_m, k_idx), shape=(TILE_M, TILE_K))
+        b_tile = ct.load(B, index=(k_idx, bid_n), shape=(TILE_K, TILE_N))
+
+        a_scale = ct.load(As, index=(bid_m, k_idx), shape=(TILE_M, 1))
+        b_scale = ct.load(Bs, index=(k_idx, bid_n), shape=(1, 1))
+
+        dot_prod = ct.mma(a_tile, b_tile, ct.zeros((TILE_M, TILE_N), dtype=ct.float32))
+    
+        acc += dot_prod * (a_scale * b_scale)
+
+    bias_tile = ct.load(bias, index=(0, bid_n), shape=(1, TILE_N))
+    acc += bias_tile
     ct.store(C, index=(bid_m, bid_n), tile=ct.astype(acc, C.dtype))
 
 def cutile_blockwise_mm(A: torch.Tensor, B: torch.Tensor, As: torch.Tensor, Bs: torch.Tensor, out_dtype: torch.dtype, bias: torch.Tensor = None)-> torch.Tensor:
@@ -124,11 +147,9 @@ def cutile_blockwise_mm(A: torch.Tensor, B: torch.Tensor, As: torch.Tensor, Bs: 
     if config:
         # Load tuned parameters
         TILE_M, TILE_N, TILE_K, GROUP_SIZE_M = config["block_sizes"]
-        #print(f"Using tuned config: device={DEVICE_NAME}, M={M}, N={N}, K={K}, TILE_M={TILE_M}, TILE_N={TILE_N}, TILE_K={TILE_K}, GROUP_SIZE_M={GROUP_SIZE_M}")
     else:
         # Fallback to safe defaults if not tuned for this exact M
         TILE_M, TILE_N, TILE_K, GROUP_SIZE_M = 128, 128, 128, 1
-        #print ("cuTile Default: No config found for this shape, using default TILE_M=128, TILE_N=128, TILE_K=128, GROUP_SIZE_M=1")
     #assert B.is_contiguous(), "B must be contiguous"
     #assert Bs.T.is_contiguous(), "Bs must be contiguous"
 
@@ -146,29 +167,88 @@ def cutile_blockwise_mm(A: torch.Tensor, B: torch.Tensor, As: torch.Tensor, Bs: 
     grid_1d = (grid_m * grid_n, 1, 1)
 
     stream_ptr = torch.cuda.current_stream().cuda_stream
-    USE_BIAS = 0
     if bias is not None:
-        USE_BIAS = 1
         if bias.dim() == 1:
-            bias_tensor = bias.unsqueeze(0)
-        else:
-            bias_tensor = bias
-        assert bias_tensor.shape[1] == N, f"Bias shape {bias_tensor.shape} doesn't match N={N}"
-        assert bias_tensor.dtype == out_dtype, f"Bias dtype {bias_tensor.dtype} must match out_dtype {out_dtype}"
+            bias = bias.unsqueeze(0)  # shape become(1, N)
+        assert bias.shape[1] == N, f"Bias shape {bias.shape} doesn't match N={N}"
+        assert bias.dtype == out_dtype, f"Bias dtype {bias.dtype} must match out_dtype {out_dtype}"
+        ct.launch(stream_ptr, grid_1d, matmul_kernel_use_bias, 
+              (A, B, As, Bs, C, bias, M, N, K, TILE_M, TILE_N, TILE_K, GROUP_SIZE_M))
     else:
-        bias_tensor = torch.empty((1, N), dtype=out_dtype, device=A.device)
-    ct.launch(stream_ptr, grid_1d, matmul_kernel, 
-              (A, B, As, Bs, C, bias_tensor, M, N, K, TILE_M, TILE_N, TILE_K, GROUP_SIZE_M, USE_BIAS))
+        ct.launch(stream_ptr, grid_1d, matmul_kernel, 
+                (A, B, As, Bs, C, M, N, K, TILE_M, TILE_N, TILE_K, GROUP_SIZE_M))
     return C
 
-def cutile_scaled_mm_fake(self, A, B, As, Bs, out_dtype,bias=None) -> torch.Tensor:
-    print("In forward_native of CuTileBlockwiseMM")
+def cutile_scaled_mm_fake(A, B, As, Bs, out_dtype,bias=None) -> torch.Tensor:
     M = A.shape[0]
     N = B.shape[1]
     return torch.empty((M, N), device=A.device, dtype=out_dtype)
+
+
+def cutile_blockwise_mm_out(out: torch.Tensor,A: torch.Tensor, B: torch.Tensor, As: torch.Tensor, Bs: torch.Tensor, bias: torch.Tensor = None)->torch.Tensor:
+    """
+    A: (M, K) in fp8, row-major (stride: (K, 1))
+    B: (K, N) in fp8, col-major (stride: (1, K))
+    As(A_scale): (M, k_tiles) , col-major (stride: (1, M)) 
+    Bs: (k_tiles, n_tiles), col-major (stride: (1, k_tiles))
+    Out: (M, N) in out_dtype, row-major (stride: (N, 1))
+
+    """
+    M, K = A.size()
+    K_, N = B.size()
+    exact_key = f"mperrank_{M}_n_{N}_k_{K}"
+    config = _CONFIG_INDEX.get((DEVICE_NAME, exact_key))
+
+    # if config is None:
+    #     config = _CONFIG_INDEX.get((DEVICE_NAME, int(N), int(K)))
+    
+    if config:
+        # Load tuned parameters
+        TILE_M, TILE_N, TILE_K, GROUP_SIZE_M = config["block_sizes"]
+    else:
+        # Fallback to safe defaults if not tuned for this exact M
+        TILE_M, TILE_N, TILE_K, GROUP_SIZE_M = 128, 128, 128, 1
+    
+    assert out.shape == (M, N), "Output shape mismatch"
+    assert out.device == A.device, "Device mismatch"
+    assert As.dtype == torch.float32, "As must be float32"
+    assert Bs.dtype == torch.float32, "Bs must be float32"
+    out_dtype = out.dtype
+    M, K = A.shape
+    K_check, N = B.shape 
+    
+    assert K == K_check, f"Inner dimension mismatch: A_K={K}, B_K={K_check}"
+
+    grid_m = ct.cdiv(M, TILE_M)
+    grid_n = ct.cdiv(N, TILE_N)
+    grid_1d = (grid_m * grid_n, 1, 1)
+
+    stream_ptr = torch.cuda.current_stream().cuda_stream
+    if bias is not None:
+        if bias.dim() == 1:
+            bias = bias.unsqueeze(0)  # shape become(1, N)
+        assert bias.shape[1] == N, f"Bias shape {bias.shape} doesn't match N={N}"
+        assert bias.dtype == out_dtype, f"Bias dtype {bias.dtype} must match out_dtype {out_dtype}"
+        ct.launch(stream_ptr, grid_1d, matmul_kernel_use_bias, 
+              (A, B, As, Bs, out, bias, M, N, K, TILE_M, TILE_N, TILE_K, GROUP_SIZE_M))
+    else:
+        
+        ct.launch(stream_ptr, grid_1d, matmul_kernel, 
+                (A, B, As, Bs, out, M, N, K, TILE_M, TILE_N, TILE_K, GROUP_SIZE_M))
+    return out 
+
+def cutile_scaled_mm_out_fake(out, A, B, As, Bs, bias=None) -> torch.Tensor:
+    return out
 
 direct_register_custom_op(
     op_name="cutile_scaled_mm",
     op_func=cutile_blockwise_mm,
     fake_impl=cutile_scaled_mm_fake,
+)
+
+direct_register_custom_op(
+    op_name="cutile_scaled_mm_out",
+    op_func=cutile_blockwise_mm_out,
+    fake_impl=cutile_scaled_mm_out_fake,
+    mutates_args=["out"],
 )
