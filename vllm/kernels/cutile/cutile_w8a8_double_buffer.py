@@ -78,33 +78,75 @@ def map_block_to_tile_grouped(M, N, tm, tn, GROUP_SIZE_M):
 
 
 @ct.kernel(num_ctas=ct.ByTarget(sm_121=4))
-def matmul_kernel(A, B, As, Bs, C, bias,
+def matmul_kernel(A, B, As, Bs, C,
                                  M: ConstInt, N: ConstInt, K: ConstInt,
                                  TILE_M: ConstInt, TILE_N: ConstInt, TILE_K: ConstInt,
-                                 GROUP_SIZE_M:ConstInt = 1,
-                                 USE_BIAS: ConstInt = 0 ):
+                                 GROUP_SIZE_M:ConstInt = 1 ):
 
     bid_m, bid_n = map_block_to_tile_grouped(M, N, TILE_M, TILE_N, GROUP_SIZE_M)
     num_tiles_k = ct.cdiv(K, TILE_K)
-
+    
     acc = ct.zeros((TILE_M, TILE_N), dtype=ct.float32)
 
-    for k_idx in range(num_tiles_k):
-        a_tile = ct.load(A, index=(bid_m, k_idx), shape=(TILE_M, TILE_K))
-        b_tile = ct.load(B, index=(k_idx, bid_n), shape=(TILE_K, TILE_N))
+    a0 = ct.zeros((TILE_M, TILE_K), dtype=A.dtype)
+    b0 = ct.zeros((TILE_K, TILE_N), dtype=B.dtype)
+    sa0 = ct.zeros((TILE_M, 1), dtype=ct.float32)
+    sb0 = ct.zeros((1, 1), dtype=ct.float32)
 
-        a_scale = ct.load(As, index=(bid_m, k_idx), shape=(TILE_M, 1))
-        b_scale = ct.load(Bs, index=(k_idx, bid_n), shape=(1, 1))
+    a1 = ct.zeros((TILE_M, TILE_K), dtype=A.dtype)
+    b1 = ct.zeros((TILE_K, TILE_N), dtype=B.dtype)
+    sa1 = ct.zeros((TILE_M, 1), dtype=ct.float32)
+    sb1 = ct.zeros((1, 1), dtype=ct.float32)
 
-        dot_prod = ct.mma(a_tile, b_tile, ct.zeros((TILE_M, TILE_N), dtype=ct.float32))
-    
-        acc += dot_prod * (a_scale * b_scale)
-    if USE_BIAS:
-        bias_tile = ct.load(bias, index=(0, bid_n), shape=(1, TILE_N))
-        acc += bias_tile
+    # load first tile (k=0)
+    if num_tiles_k > 0:
+        a0 = ct.load(A, index=(bid_m, 0), shape=(TILE_M, TILE_K))
+        b0 = ct.load(B, index=(0, bid_n), shape=(TILE_K, TILE_N))
+        sa0 = ct.load(As, index=(bid_m, 0), shape=(TILE_M, 1))
+        sb0 = ct.load(Bs, index=(0, bid_n), shape=(1, 1))
+
+    #  process k and pre-fetch nk (next_k)
+    for k in range(num_tiles_k - 1):
+        nk = k + 1
+        if k % 2 == 0:
+            # even stage 
+            a1 = ct.load(A, index=(bid_m, nk), shape=(TILE_M, TILE_K))
+            b1 = ct.load(B, index=(nk, bid_n), shape=(TILE_K, TILE_N))
+            sa1 = ct.load(As, index=(bid_m, nk), shape=(TILE_M, 1))
+            sb1 = ct.load(Bs, index=(nk, bid_n), shape=(1, 1))
+            
+            dot0 = ct.mma(a0, b0, ct.zeros((TILE_M, TILE_N), dtype=ct.float32))
+            acc += dot0 * (sa0 * sb0)
+        else:
+            # odd stage 
+            a0 = ct.load(A, index=(bid_m, nk), shape=(TILE_M, TILE_K))
+            b0 = ct.load(B, index=(nk, bid_n), shape=(TILE_K, TILE_N))
+            sa0 = ct.load(As, index=(bid_m, nk), shape=(TILE_M, 1))
+            sb0 = ct.load(Bs, index=(nk, bid_n), shape=(1, 1))
+            
+            dot1 = ct.mma(a1, b1, ct.zeros((TILE_M, TILE_N), dtype=ct.float32))
+            acc += dot1 * (sa1 * sb1)
+
+    #  process the final tile that was loaded but not computed
+    if num_tiles_k > 0:
+        if (num_tiles_k - 1) % 2 == 0:
+            if num_tiles_k % 2 == 0:
+                dot_last = ct.mma(a1, b1, ct.zeros((TILE_M, TILE_N), dtype=ct.float32))
+                acc += dot_last * (sa1 * sb1)
+            else:
+                if num_tiles_k == 1:
+                    dot_last = ct.mma(a0, b0, ct.zeros((TILE_M, TILE_N), dtype=ct.float32))
+                    acc += dot_last * (sa0 * sb0)
+                else:
+                    dot_last = ct.mma(a0, b0, ct.zeros((TILE_M, TILE_N), dtype=ct.float32))
+                    acc += dot_last * (sa0 * sb0)
+        else:
+            dot_last = ct.mma(a1, b1, ct.zeros((TILE_M, TILE_N), dtype=ct.float32))
+            acc += dot_last * (sa1 * sb1)
+
     ct.store(C, index=(bid_m, bid_n), tile=ct.astype(acc, C.dtype))
 
-def cutile_blockwise_mm(A: torch.Tensor, B: torch.Tensor, As: torch.Tensor, Bs: torch.Tensor, out_dtype: torch.dtype, bias: torch.Tensor = None)-> torch.Tensor:
+def cutile_blockwise_mm(A: torch.Tensor, B: torch.Tensor, As: torch.Tensor, Bs: torch.Tensor, out_dtype: torch.dtype)-> torch.Tensor:
     """
     A: (M, K) in fp8, row-major (stride: (K, 1))
     B: (K, N) in fp8, col-major (stride: (1, K))
@@ -146,22 +188,12 @@ def cutile_blockwise_mm(A: torch.Tensor, B: torch.Tensor, As: torch.Tensor, Bs: 
     grid_1d = (grid_m * grid_n, 1, 1)
 
     stream_ptr = torch.cuda.current_stream().cuda_stream
-    USE_BIAS = 0
-    if bias is not None:
-        USE_BIAS = 1
-        if bias.dim() == 1:
-            bias_tensor = bias.unsqueeze(0)
-        else:
-            bias_tensor = bias
-        assert bias_tensor.shape[1] == N, f"Bias shape {bias_tensor.shape} doesn't match N={N}"
-        assert bias_tensor.dtype == out_dtype, f"Bias dtype {bias_tensor.dtype} must match out_dtype {out_dtype}"
-    else:
-        bias_tensor = torch.empty((1, N), dtype=out_dtype, device=A.device)
+    
     ct.launch(stream_ptr, grid_1d, matmul_kernel, 
-              (A, B, As, Bs, C, bias_tensor, M, N, K, TILE_M, TILE_N, TILE_K, GROUP_SIZE_M, USE_BIAS))
+              (A, B, As, Bs, C, M, N, K, TILE_M, TILE_N, TILE_K, GROUP_SIZE_M))
     return C
 
-def cutile_scaled_mm_fake(self, A, B, As, Bs, out_dtype,bias=None) -> torch.Tensor:
+def cutile_scaled_mm_fake(self, A, B, As, Bs, out_dtype) -> torch.Tensor:
     print("In forward_native of CuTileBlockwiseMM")
     M = A.shape[0]
     N = B.shape[1]

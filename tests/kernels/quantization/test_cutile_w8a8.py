@@ -15,6 +15,7 @@ from vllm.benchmarks.lib.utils import default_vllm_config
     torch.bfloat16,
     torch.float16
 ])
+@pytest.mark.parametrize("use_bias", [True, False])
 @pytest.mark.parametrize("M, N, K", [
      # (1, 12288, 4096),  # will fail
       (128, 128, 128),
@@ -32,7 +33,7 @@ from vllm.benchmarks.lib.utils import default_vllm_config
       (384, 1000, 2048),                                                                         
 
 ])
-def test_cutile_blockwise_fp8_kernel(out_dtype, M, N, K, default_vllm_config):
+def test_cutile_blockwise_fp8_kernel(out_dtype,use_bias, M, N, K, default_vllm_config):
     torch.set_default_device("cuda")
 
     block_size = [128, 128]
@@ -61,9 +62,15 @@ def test_cutile_blockwise_fp8_kernel(out_dtype, M, N, K, default_vllm_config):
     A_fp8_cutlass, As_cutlass = per_token_group_quant_fp8(
         A_fp32, block_size[1], column_major_scales=True
     )
+    if use_bias:
+        bias = torch.rand(N, dtype=out_dtype)*0.001
+    else:
+        bias = None
     ref_out = native_w8a8_block_matmul(A_fp8, B_fp8, As, Bs, block_size, out_dtype)   
+    if use_bias:
+        ref_out+=bias
     # this matches the layout of cutlass_scaled_mm kernel(see in test_block_fp8.py), which uses column-major for B and Bs
-    out = torch.ops.vllm.cutile_scaled_mm(A_fp8_cutlass, B_fp8_t, As_cutlass, Bs.t(), out_dtype)
+    out = torch.ops.vllm.cutile_scaled_mm(A_fp8_cutlass, B_fp8_t, As_cutlass, Bs.t(), out_dtype,bias)
     rel_diff = torch.mean(torch.abs(out.float() - ref_out.float())) / torch.mean(torch.abs(ref_out.float()))
     assert rel_diff < 0.001
     torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
