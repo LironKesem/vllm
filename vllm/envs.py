@@ -1208,7 +1208,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
 
     "VLLM_SWITCH_TO_CUTILE": lambda: bool(
-        int(os.getenv("VLLM_SWITCH_TO_CUTILE", "1"))
+        int(os.getenv("VLLM_SWITCH_TO_CUTILE", "0"))
     ),
     # Allow use of DeepGemm kernels for fused moe ops.
     "VLLM_USE_DEEP_GEMM": lambda: bool(int(os.getenv("VLLM_USE_DEEP_GEMM", "1"))),
