@@ -140,6 +140,7 @@ MoEBackend = Literal[
 LinearBackend = Literal[
     "auto",
     "cutlass",
+    "helion",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
     "flashinfer_cudnn",
