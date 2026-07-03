@@ -106,6 +106,9 @@ from vllm.model_executor.kernels.linear.nvfp4.cutlass import (
 from vllm.model_executor.kernels.linear.nvfp4.helion import (
     HelionNvFp4LinearKernel
 )
+from vllm.model_executor.kernels.linear.nvfp4.helion_w4a16 import (
+    HelionNvFp4W4A16LinearKernel
+)
 from vllm.model_executor.kernels.linear.nvfp4.emulation import (
     EmulationNvFp4LinearKernel,
 )
@@ -204,6 +207,9 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     },
     "helion":{
         HelionNvFp4LinearKernel,
+    },
+    "helion_w4a16":{
+        HelionNvFp4W4A16LinearKernel,
     },
     "flashinfer_cutlass": {
         FlashInferFP8ScaledMMLinearKernel,
@@ -404,6 +410,7 @@ _POSSIBLE_NVFP4_KERNELS: dict[PlatformEnum, list[type[NvFp4LinearKernel]]] = {
         # --linear-backend flashinfer_b12x to opt in explicitly.
         FlashInferCutlassNvFp4LinearKernel,
         HelionNvFp4LinearKernel,
+        HelionNvFp4W4A16LinearKernel,
         CutlassNvFp4LinearKernel,
         MarlinNvFp4LinearKernel,
         FlashInferTrtllmNvFp4LinearKernel,

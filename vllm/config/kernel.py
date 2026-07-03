@@ -141,6 +141,7 @@ LinearBackend = Literal[
     "auto",
     "cutlass",
     "helion",
+    "helion_w4a16",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
     "flashinfer_cudnn",
